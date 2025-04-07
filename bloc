@@ -1,0 +1,197 @@
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+
+declare_id!("still in development");
+
+#[program]
+pub mod bloc2token {
+    use super::*;
+
+    /// Initialize the global state for the token sale.
+    /// Note: All parameters related to the Core DAO blockchain have been removed.
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        dev_wallet: Pubkey,
+        base_price: u64,
+        current_price: u64,
+    ) -> Result<()> {
+        let state = &mut ctx.accounts.state;
+        state.dev_wallet = dev_wallet;
+        state.base_price = base_price;
+        state.current_price = current_price;
+
+        // Constants & supply (using u64 values to represent token amounts with assumed decimals)
+        state.total_supply = 100_000_000 * 1_000_000_000; // e.g. 1e18 equivalent
+        state.initial_presale_tokens = 2_000_000 * 1_000_000_000;
+        state.initial_reward_pool = 10_000_000 * 1_000_000_000;
+        state.presale_limit = 20_000;
+        state.liquidity_fee = 3;
+        state.swap_cooldown = 24 * 60 * 60; // 24 hours in seconds
+
+        // Set sale state
+        state.presale_active = true;
+        state.sale_active = false;
+        state.remaining_presale_tokens = state.initial_presale_tokens;
+        state.total_presale_purchased_tokens = 0;
+        state.reward_pool = state.initial_reward_pool;
+        state.presale_count = 0;
+
+        Ok(())
+    }
+
+    /// Allows a buyer to purchase tokens during the presale.
+    /// Payment is assumed to be handled off-chain (or via lamports sent with the transaction)
+    /// and only the Bloc2Token transfer is performed here.
+    pub fn buy_tokens(ctx: Context<BuyTokens>, amount_paid: u64) -> Result<()> {
+        let state = &mut ctx.accounts.state;
+        // Check presale is active.
+        require!(state.presale_active, ErrorCode::PresaleEnded);
+        require!(amount_paid > 0, ErrorCode::InvalidAmount);
+
+        // Compute tokens to receive: tokens = amount_paid * DECIMALS / current_price.
+        // (Assuming a DECIMALS factor of 1_000_000_000 to represent 1e9.)
+        let decimals_factor: u64 = 1_000_000_000;
+        let tokens_to_receive = amount_paid
+            .checked_mul(decimals_factor)
+            .unwrap()
+            .checked_div(state.current_price)
+            .unwrap();
+
+        require!(
+            tokens_to_receive <= state.remaining_presale_tokens,
+            ErrorCode::InsufficientPresaleTokens
+        );
+
+        state.remaining_presale_tokens = state
+            .remaining_presale_tokens
+            .checked_sub(tokens_to_receive)
+            .unwrap();
+        state.presale_count = state.presale_count.checked_add(1).unwrap();
+
+        // Update buyer state – if this is the first contribution, set a lock time.
+        let buyer_state = &mut ctx.accounts.buyer;
+        if buyer_state.contribution == 0 {
+            // Lock tokens for 20 days (in seconds)
+            buyer_state.lock_time = Clock::get()?.unix_timestamp + 20 * 24 * 60 * 60;
+        }
+        buyer_state.contribution = buyer_state.contribution.checked_add(tokens_to_receive).unwrap();
+        state.total_presale_purchased_tokens = state
+            .total_presale_purchased_tokens
+            .checked_add(tokens_to_receive)
+            .unwrap();
+
+        // Transfer Bloc2Token tokens (the presale allocation) from the treasury to the buyer.
+        token::transfer(
+            ctx.accounts.into_transfer_treasury_context(),
+            tokens_to_receive,
+        )?;
+
+        Ok(())
+    }
+}
+
+//////////////////////////
+/// Account Definitions
+//////////////////////////
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    /// Global state account holding configuration and sale data.
+    #[account(init, payer = admin, space = 8 + GlobalState::LEN)]
+    pub state: Account<'info, GlobalState>,
+    /// The treasury holding Bloc2Token tokens for sale.
+    #[account(mut)]
+    pub treasury: Box<Account<'info, TokenAccount>>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[account]
+pub struct GlobalState {
+    pub dev_wallet: Pubkey,
+    pub base_price: u64,
+    pub current_price: u64,
+    pub total_supply: u64,
+    pub initial_presale_tokens: u64,
+    pub initial_reward_pool: u64,
+    pub presale_limit: u64,
+    pub liquidity_fee: u64,
+    pub swap_cooldown: i64,
+    pub presale_active: bool,
+    pub sale_active: bool,
+    pub remaining_presale_tokens: u64,
+    pub total_presale_purchased_tokens: u64,
+    pub reward_pool: u64,
+    pub presale_count: u64,
+    // Additional state variables as needed.
+}
+
+impl GlobalState {
+    // Adjust this constant to reflect the actual serialized size.
+    // Here we have: 1 Pubkey (32) + 8*8 (64 bytes) + 8 (presale_count) + 2 bools (2) = ~32+64+8+2 = 106 bytes (rounded up)
+    const LEN: usize = 32 + (8 * 8) + 8 + 2;
+}
+
+#[derive(Accounts)]
+pub struct BuyTokens<'info> {
+    #[account(mut)]
+    pub state: Account<'info, GlobalState>,
+    #[account(mut, init_if_needed, payer = buyer, space = 8 + BuyerState::LEN)]
+    pub buyer: Account<'info, BuyerState>,
+    /// The buyer’s account that will receive Bloc2Token tokens.
+    #[account(mut)]
+    pub buyer_bloc2_token_account: Box<Account<'info, TokenAccount>>,
+    /// The treasury holding Bloc2Token tokens.
+    #[account(mut)]
+    pub treasury: Box<Account<'info, TokenAccount>>,
+    /// The mint for Bloc2Token.
+    #[account(mut)]
+    pub bloc2_token_mint: Account<'info, Mint>,
+    pub token_program: Program<'info, Token>,
+    #[account(mut)]
+    pub buyer_signer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[account]
+pub struct BuyerState {
+    pub contribution: u64,
+    pub lock_time: i64,
+    // Removed reward_claimed and related reward logic.
+}
+
+impl BuyerState {
+    const LEN: usize = 8 + 8;
+}
+
+//////////////////////////////
+/// Helper CPI Contexts
+//////////////////////////////
+
+impl<'info> BuyTokens<'info> {
+    /// Creates a context for transferring Bloc2Token tokens from the treasury to the buyer.
+    fn into_transfer_treasury_context(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let cpi_accounts = Transfer {
+            from: self.treasury.to_account_info().clone(),
+            to: self.buyer_bloc2_token_account.to_account_info().clone(),
+            authority: self.treasury.to_account_info().clone(), // In practice, use a PDA or proper authority.
+        };
+        CpiContext::new(self.token_program.to_account_info().clone(), cpi_accounts)
+    }
+}
+
+//////////////////////////////
+/// Error Definitions
+//////////////////////////////
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Presale has ended.")]
+    PresaleEnded,
+    #[msg("Invalid amount provided.")]
+    InvalidAmount,
+    #[msg("Not enough presale tokens remaining.")]
+    InsufficientPresaleTokens,
+}
